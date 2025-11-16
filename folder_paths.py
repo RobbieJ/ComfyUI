@@ -427,3 +427,93 @@ def get_input_subfolders() -> list[str]:
         return sorted(folders)
     except FileNotFoundError:
         return []
+
+def create_symlink(src: str, dst: str, use_hardlink: bool = False) -> bool:
+    """Create a symlink or hardlink from src to dst
+
+    Args:
+        src: Source file path (target)
+        dst: Destination path (link location)
+        use_hardlink: Use hardlink instead of symlink (default: False)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    import platform
+
+    # Ensure destination directory exists
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+    # Remove existing file/link if it exists
+    if os.path.exists(dst) or os.path.islink(dst):
+        try:
+            os.remove(dst)
+        except Exception as e:
+            logging.error(f"Failed to remove existing file at {dst}: {e}")
+            return False
+
+    try:
+        if use_hardlink:
+            # Create hardlink
+            os.link(src, dst)
+            logging.info(f"Created hardlink: {dst} -> {src}")
+        else:
+            # Create symlink
+            if platform.system() == "Windows":
+                # Windows requires admin or developer mode for symlinks
+                # Try symlink first, fall back to hardlink if permission denied
+                try:
+                    os.symlink(src, dst)
+                    logging.info(f"Created symlink: {dst} -> {src}")
+                except OSError as e:
+                    if e.winerror == 1314:  # Privilege not held
+                        logging.warning(f"Symlink permission denied on Windows, using hardlink instead")
+                        os.link(src, dst)
+                        logging.info(f"Created hardlink: {dst} -> {src}")
+                    else:
+                        raise
+            else:
+                # Unix-like systems (Linux, macOS)
+                os.symlink(src, dst)
+                logging.info(f"Created symlink: {dst} -> {src}")
+
+        return True
+    except Exception as e:
+        logging.error(f"Failed to create link from {src} to {dst}: {e}")
+        return False
+
+def is_symlink_or_hardlink(path: str) -> bool:
+    """Check if path is a symlink or hardlink
+
+    Args:
+        path: File path to check
+
+    Returns:
+        True if path is a symlink or hardlink
+    """
+    if not os.path.exists(path):
+        return False
+
+    # Check if symlink
+    if os.path.islink(path):
+        return True
+
+    # Check if hardlink (more than one link to inode)
+    try:
+        stat_info = os.stat(path)
+        return stat_info.st_nlink > 1
+    except:
+        return False
+
+def resolve_link(path: str) -> str:
+    """Resolve symlink to actual file path
+
+    Args:
+        path: Path to resolve
+
+    Returns:
+        Resolved path (or original path if not a symlink)
+    """
+    if os.path.islink(path):
+        return os.path.realpath(path)
+    return path

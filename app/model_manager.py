@@ -9,10 +9,14 @@ import folder_paths
 import glob
 import comfy.utils
 import aiohttp
+import hashlib
+import uuid
+import shutil
 from aiohttp import web
 from PIL import Image
 from io import BytesIO
 from folder_paths import map_legacy, filter_files_extensions, filter_files_content_types
+from app.model_registry import get_registry
 
 
 class ModelFileManager:
@@ -79,15 +83,59 @@ class ModelFileManager:
 
         @routes.post("/models/download")
         async def download_model(request):
+            """Download model with hash verification and deduplication
+
+            IMPORTANT: API keys (huggingface_token, civitai_api_key) are ephemeral
+            and NEVER stored. They are used only for this request and immediately
+            garbage collected.
+            """
             body = await request.json()
             url = body.get("url")
             folder = body.get("folder")
             filename = body.get("filename")
+            expected_sha256 = body.get("sha256")  # NEW: For deduplication and verification
+            display_name = body.get("display_name")  # NEW: For registry metadata
+
+            # Ephemeral API keys (NEVER logged or stored)
             huggingface_token = body.get("huggingface_token")
+            civitai_api_key = body.get("civitai_api_key")
+
             path_index = body.get("path_index", 0)
 
             if not url or not folder:
                 return web.json_response({"error": "Missing required fields 'url' and 'folder'"}, status=400)
+
+            # Get registry for deduplication
+            registry = get_registry()
+
+            # Check if model already exists (deduplication)
+            if expected_sha256:
+                existing = registry.find_by_hash(expected_sha256)
+                if existing:
+                    logging.info(f"Model already exists with hash {expected_sha256[:16]}... at {existing['file_path']}")
+
+                    # Determine if we need to create a symlink/alias
+                    requested_path = os.path.join(folder, filename) if filename else None
+                    if requested_path and requested_path != existing["file_path"]:
+                        # Create alias in registry
+                        registry.add_alias(expected_sha256, requested_path)
+
+                        # Create symlink if file doesn't exist at requested location
+                        target_folder = folder_paths.folder_names_and_paths[folder][0][path_index]
+                        symlink_path = os.path.join(target_folder, filename)
+                        existing_full_path = folder_paths.get_full_path_or_raise(folder, os.path.basename(existing["file_path"]))
+
+                        if not os.path.exists(symlink_path):
+                            folder_paths.create_symlink(existing_full_path, symlink_path)
+                            logging.info(f"Created symlink: {symlink_path} -> {existing_full_path}")
+
+                    return web.json_response({
+                        "status": "already_exists",
+                        "sha256": expected_sha256,
+                        "path": existing["file_path"],
+                        "size_bytes": existing["size_bytes"],
+                        "message": "Model already downloaded"
+                    })
 
             folder = map_legacy(folder)
             if folder not in folder_paths.folder_names_and_paths:
@@ -130,6 +178,12 @@ class ModelFileManager:
             target_folder = available_paths[path_index] if 0 <= path_index < len(available_paths) else available_paths[0]
 
             os.makedirs(target_folder, exist_ok=True)
+
+            # Download to temp location first for hash verification
+            temp_dir = os.path.join(folder_paths.base_path, "models", ".cache", "tmp")
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_path = os.path.join(temp_dir, f"{uuid.uuid4()}.tmp")
+
             destination_path = os.path.abspath(os.path.join(target_folder, normalized_relative))
 
             if not destination_path.startswith(os.path.abspath(target_folder)):
@@ -137,9 +191,24 @@ class ModelFileManager:
 
             os.makedirs(os.path.dirname(destination_path), exist_ok=True)
 
+            # Build headers with ephemeral authentication
             headers = {}
-            if huggingface_token:
+            download_url = url
+
+            if huggingface_token and "huggingface.co" in url:
                 headers["Authorization"] = f"Bearer {huggingface_token}"
+                # Note: Token NOT logged
+
+            if civitai_api_key and "civitai.com" in url:
+                # Civitai uses API key in URL params
+                if "?" in download_url:
+                    download_url += f"&token={civitai_api_key}"
+                else:
+                    download_url += f"?token={civitai_api_key}"
+                # Note: Token NOT logged
+
+            # Log request without auth details
+            logging.info(f"Download request: {filename} from {url[:50]}...")
 
             total_bytes = 0
             emitted_progress = 0
@@ -173,8 +242,14 @@ class ModelFileManager:
             try:
                 timeout = aiohttp.ClientTimeout(total=60 * 60)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url, headers=headers) as response:
-                        if response.status != 200:
+                    # Use download_url which may contain API key
+                    async with session.get(download_url, headers=headers) as response:
+                        # Handle auth errors
+                        if response.status == 401:
+                            return web.json_response({"error": "Authentication failed - invalid token"}, status=401)
+                        elif response.status == 403:
+                            return web.json_response({"error": "Access denied - check token permissions"}, status=403)
+                        elif response.status != 200:
                             return web.json_response({"error": f"Download failed with status {response.status}"}, status=response.status)
 
                         content_length = response.headers.get("Content-Length")
@@ -192,10 +267,17 @@ class ModelFileManager:
                         )
 
                         try:
-                            with open(destination_path, "wb") as outfile:
+                            # Download to temp file and calculate hash
+                            hasher = hashlib.sha256() if expected_sha256 else None
+
+                            with open(temp_path, "wb") as outfile:
                                 async for chunk in response.content.iter_chunked(1024 * 1024):
                                     outfile.write(chunk)
                                     total_bytes += len(chunk)
+
+                                    # Update hash
+                                    if hasher:
+                                        hasher.update(chunk)
 
                                     if total_length:
                                         progress = min(total_bytes / total_length, 1.0)
@@ -214,6 +296,68 @@ class ModelFileManager:
                                             bytes_written=total_bytes,
                                         )
 
+                            # Verify hash if expected
+                            calculated_hash = hasher.hexdigest() if hasher else None
+
+                            if expected_sha256 and calculated_hash != expected_sha256:
+                                os.remove(temp_path)
+                                await emit_progress(
+                                    stream_response,
+                                    error=f"Hash mismatch: expected {expected_sha256[:16]}..., got {calculated_hash[:16]}..."
+                                )
+                                return stream_response
+
+                            # Check if another request downloaded this while we were downloading (race condition)
+                            if calculated_hash:
+                                existing = registry.find_by_hash(calculated_hash)
+                                if existing:
+                                    logging.info(f"Model downloaded by another request, using existing file")
+                                    os.remove(temp_path)
+
+                                    # Create symlink to existing file
+                                    existing_full_path = folder_paths.get_full_path_or_raise(folder, os.path.basename(existing["file_path"]))
+                                    if not os.path.exists(destination_path):
+                                        folder_paths.create_symlink(existing_full_path, destination_path)
+                                        registry.add_alias(calculated_hash, os.path.join(folder, normalized_relative))
+
+                                    await emit_progress(
+                                        stream_response,
+                                        progress=1.0,
+                                        bytes_written=total_bytes,
+                                        total_length=total_length,
+                                    )
+                                    await stream_response.write(json.dumps({
+                                        "message": "Download complete (deduplicated)",
+                                        "path": destination_path,
+                                        "folder": folder,
+                                        "filename": normalized_relative,
+                                        "sha256": calculated_hash,
+                                        "deduplicated": True
+                                    }, separators=(",", ":")).encode("utf-8") + b"\n")
+
+                                    return stream_response
+
+                            # Move from temp to final location
+                            shutil.move(temp_path, destination_path)
+
+                            # Register in database (WITHOUT any auth keys)
+                            if calculated_hash:
+                                # Strip query params from URL (may contain keys)
+                                clean_url = url.split("?")[0]
+
+                                registry.add_model(
+                                    sha256=calculated_hash,
+                                    file_path=os.path.join(folder, normalized_relative),
+                                    size_bytes=total_bytes,
+                                    source_url=clean_url,
+                                    metadata={
+                                        "filename": normalized_relative,
+                                        "folder": folder,
+                                        "display_name": display_name or normalized_relative
+                                    }
+                                )
+                                logging.info(f"Registered model: {normalized_relative} (hash: {calculated_hash[:16]}...)")
+
                             await emit_progress(
                                 stream_response,
                                 progress=1.0,
@@ -225,9 +369,16 @@ class ModelFileManager:
                                 "path": destination_path,
                                 "folder": folder,
                                 "filename": normalized_relative,
+                                "sha256": calculated_hash,
+                                "size_bytes": total_bytes
                             }, separators=(",", ":")).encode("utf-8") + b"\n")
                         except Exception as e:
                             logging.exception("Failed to download model")
+                            if os.path.exists(temp_path):
+                                try:
+                                    os.remove(temp_path)
+                                except OSError:
+                                    pass
                             if os.path.exists(destination_path):
                                 try:
                                     os.remove(destination_path)
@@ -241,6 +392,74 @@ class ModelFileManager:
             except Exception as e:
                 logging.exception("Failed to download model")
                 return web.json_response({"error": str(e)}, status=500)
+            finally:
+                # Ephemeral keys are garbage collected here (never stored)
+                pass
+
+        @routes.post("/models/check-dependencies")
+        async def check_dependencies(request):
+            """Check which models from workflow dependencies are missing
+
+            Returns breakdown of existing vs missing models with deduplication info
+            """
+            body = await request.json()
+            dependencies = body.get("dependencies", {})
+
+            if not dependencies:
+                return web.json_response({"error": "No dependencies provided"}, status=400)
+
+            registry = get_registry()
+
+            result = {
+                "missing": [],
+                "existing": [],
+                "total_download_size": 0,
+                "total_saved_size": 0
+            }
+
+            # Process all model types
+            for model_type in ["checkpoints", "loras", "vae", "controlnet", "upscale_models",
+                             "text_encoders", "diffusion_models", "clip_vision", "embeddings"]:
+                models = dependencies.get(model_type, [])
+
+                for model in models:
+                    sha256 = model.get("sha256")
+                    filename = model.get("filename")
+                    size = model.get("size", 0)
+                    urls = model.get("urls", [])
+                    requires_auth = model.get("requires_auth", False)
+                    auth_provider = model.get("auth_provider")
+
+                    if not sha256 or not filename:
+                        continue
+
+                    # Check if model exists in registry
+                    existing = registry.find_by_hash(sha256)
+
+                    if existing:
+                        result["existing"].append({
+                            "filename": filename,
+                            "exists_at": existing["file_path"],
+                            "type": model_type,
+                            "sha256": sha256,
+                            "size": existing["size_bytes"],
+                            "action": "symlink" if existing["file_path"] != os.path.join(model_type, filename) else "use_existing"
+                        })
+                        result["total_saved_size"] += existing["size_bytes"]
+                    else:
+                        result["missing"].append({
+                            "filename": filename,
+                            "type": model_type,
+                            "sha256": sha256,
+                            "size": size,
+                            "urls": urls,
+                            "requires_auth": requires_auth,
+                            "auth_provider": auth_provider,
+                            "display_name": model.get("display_name", filename)
+                        })
+                        result["total_download_size"] += size
+
+            return web.json_response(result)
 
     def get_model_file_list(self, folder_name: str):
         folder_name = map_legacy(folder_name)
