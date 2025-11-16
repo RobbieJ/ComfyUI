@@ -17,10 +17,13 @@ function promptForToken(existingToken) {
     return trimmed;
 }
 
-async function requestDownload({ url, folder, filename, token }) {
+async function requestDownload({ url, folder, filename, token, pathIndex }) {
     const payload = { url, folder, filename };
     if (token) {
         payload.huggingface_token = token;
+    }
+    if (typeof pathIndex === "number") {
+        payload.path_index = pathIndex;
     }
     return api.fetchApi("/models/download", {
         method: "POST",
@@ -135,13 +138,16 @@ app.registerExtension({
             button.textContent = "Downloading...";
             button.disabled = true;
 
+            // Try to get pathIndex from button's data attribute
+            let pathIndex = button.dataset.pathIndex ? parseInt(button.dataset.pathIndex, 10) : undefined;
+
             try {
                 let token = getStoredToken();
-                let response = await requestDownload({ url, folder, filename, token });
+                let response = await requestDownload({ url, folder, filename, token, pathIndex });
 
                 if (response.status === 401 || response.status === 403) {
                     token = promptForToken(token);
-                    response = await requestDownload({ url, folder, filename, token });
+                    response = await requestDownload({ url, folder, filename, token, pathIndex });
                 }
 
                 if (!response.ok) {

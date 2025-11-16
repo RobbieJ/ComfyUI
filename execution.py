@@ -921,6 +921,27 @@ async def validate_inputs(prompt_id, prompt, item, validated):
                         else:
                             list_info = str(combo_options)
 
+                        # Extract model metadata from template properties if available
+                        model_metadata = None
+                        node_properties = prompt[unique_id].get('properties', {})
+                        node_models = node_properties.get('models', [])
+
+                        # Try to find matching model metadata by name
+                        for model in node_models:
+                            if isinstance(model, dict):
+                                model_name = model.get('name', '')
+                                model_directory = model.get('directory', '')
+                                # Match against either just the name or directory/name format
+                                if model_name == val or f"{model_directory}/{model_name}" == val:
+                                    model_metadata = {
+                                        "url": model.get('url'),
+                                        "directory": model_directory,
+                                        "name": model_name,
+                                        "hash": model.get('hash'),
+                                        "hash_type": model.get('hash_type')
+                                    }
+                                    break
+
                         error = {
                             "type": "value_not_in_list",
                             "message": "Value not in list",
@@ -931,6 +952,11 @@ async def validate_inputs(prompt_id, prompt, item, validated):
                                 "received_value": val,
                             }
                         }
+
+                        # Add model metadata to extra_info if found
+                        if model_metadata:
+                            error["extra_info"]["model_metadata"] = model_metadata
+
                         errors.append(error)
                         continue
 
