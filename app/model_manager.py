@@ -8,6 +8,7 @@ import logging
 import folder_paths
 import glob
 import comfy.utils
+import aiohttp
 from aiohttp import web
 from PIL import Image
 from io import BytesIO
@@ -75,6 +76,90 @@ class ModelFileManager:
                     return web.Response(body=img_bytes.getvalue(), content_type="image/webp")
             except:
                 return web.Response(status=404)
+
+        @routes.post("/models/download")
+        async def download_model(request):
+            body = await request.json()
+            url = body.get("url")
+            folder = body.get("folder")
+            filename = body.get("filename")
+            huggingface_token = body.get("huggingface_token")
+            path_index = body.get("path_index", 0)
+
+            if not url or not folder:
+                return web.json_response({"error": "Missing required fields 'url' and 'folder'"}, status=400)
+
+            folder = map_legacy(folder)
+            if folder not in folder_paths.folder_names_and_paths:
+                return web.json_response({"error": f"Unknown folder '{folder}'"}, status=400)
+
+            allowed_sources = ["https://civitai.com/", "https://huggingface.co/", "http://localhost:"]
+            whitelisted_urls = {
+                "https://huggingface.co/stabilityai/stable-zero123/resolve/main/stable_zero123.ckpt",
+                "https://huggingface.co/TencentARC/T2I-Adapter/resolve/main/models/t2iadapter_depth_sd14v1.pth?download=true",
+                "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+            }
+
+            if url not in whitelisted_urls:
+                if not any(url.startswith(source) for source in allowed_sources):
+                    return web.json_response({"error": "Downloads are only allowed from civitai.com or huggingface.co."}, status=400)
+
+            if filename:
+                relative_name = filename
+            else:
+                relative_name = os.path.basename(url.split("?")[0])
+
+            relative_name = relative_name.lstrip("/\\")
+            normalized_relative = os.path.normpath(relative_name)
+            if normalized_relative.startswith("..") or os.path.isabs(normalized_relative):
+                return web.json_response({"error": "Invalid filename."}, status=400)
+
+            sanitized_name = os.path.basename(normalized_relative)
+
+            if url not in whitelisted_urls:
+                allowed_extensions = {ext.lower() for ext in folder_paths.folder_names_and_paths[folder][1] if ext}
+                if allowed_extensions and allowed_extensions != {"folder"}:
+                    if not any(sanitized_name.lower().endswith(ext) for ext in allowed_extensions):
+                        return web.json_response({"error": f"Only {', '.join(sorted(allowed_extensions))} downloads are allowed."}, status=400)
+
+            available_paths = folder_paths.folder_names_and_paths[folder][0]
+            try:
+                path_index = int(path_index)
+            except (TypeError, ValueError):
+                path_index = 0
+            target_folder = available_paths[path_index] if 0 <= path_index < len(available_paths) else available_paths[0]
+
+            os.makedirs(target_folder, exist_ok=True)
+            destination_path = os.path.abspath(os.path.join(target_folder, normalized_relative))
+
+            if not destination_path.startswith(os.path.abspath(target_folder)):
+                return web.json_response({"error": "Invalid filename."}, status=400)
+
+            os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+
+            headers = {}
+            if huggingface_token:
+                headers["Authorization"] = f"Bearer {huggingface_token}"
+
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=headers) as response:
+                        if response.status != 200:
+                            return web.json_response({"error": f"Download failed with status {response.status}"}, status=response.status)
+
+                        with open(destination_path, "wb") as outfile:
+                            async for chunk in response.content.iter_chunked(1024 * 1024):
+                                outfile.write(chunk)
+            except Exception as e:
+                logging.exception("Failed to download model")
+                return web.json_response({"error": str(e)}, status=500)
+
+            return web.json_response({
+                "message": "Download complete",
+                "path": destination_path,
+                "folder": folder,
+                "filename": normalized_relative,
+            })
 
     def get_model_file_list(self, folder_name: str):
         folder_name = map_legacy(folder_name)
