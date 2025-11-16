@@ -107,9 +107,14 @@ app.registerExtension({
         document.addEventListener("click", async (event) => {
             const target = event.target;
             if (!(target instanceof HTMLElement)) return;
-            const button = target.closest("button");
+
+            // Handle both <button> and <a> tags
+            const button = target.closest("button") || target.closest("a");
             if (!button) return;
-            if (!button.title) return;
+
+            // Get URL from title attribute or href
+            const url = button.title || button.getAttribute("href");
+            if (!url) return;
 
             const container = target.closest(".comfy-missing-models");
             if (!container) return;
@@ -125,15 +130,21 @@ app.registerExtension({
             const buttonText = button.textContent?.trim().toLowerCase() || "";
             if (!buttonText.startsWith("download")) return;
 
+            // Prevent default browser download
             event.preventDefault();
             event.stopPropagation();
-
-            const url = button.title;
             const originalLabel = button.textContent;
             const progressEl = ensureProgressElement(button);
             if (progressEl) progressEl.textContent = "Starting server download...";
             button.textContent = "Downloading...";
-            button.disabled = true;
+
+            // Disable button/link
+            if (button.tagName === "BUTTON") {
+                button.disabled = true;
+            } else {
+                button.style.pointerEvents = "none";
+                button.style.opacity = "0.5";
+            }
 
             try {
                 let token = getStoredToken();
@@ -189,7 +200,13 @@ app.registerExtension({
                 button.textContent = originalLabel;
                 if (progressEl) progressEl.textContent = "";
             } finally {
-                button.disabled = false;
+                // Re-enable button/link
+                if (button.tagName === "BUTTON") {
+                    button.disabled = false;
+                } else {
+                    button.style.pointerEvents = "";
+                    button.style.opacity = "";
+                }
             }
         });
     }
