@@ -29,19 +29,70 @@ async function requestDownload({ url, folder, filename, token }) {
     });
 }
 
+function ensureProgressElement(button) {
+    const listItem = button.closest("li") || button.closest(".p-listbox-item") || button.closest(".flex");
+    if (!listItem) return null;
+    let progress = listItem.querySelector(".comfy-server-download-progress");
+    if (!progress) {
+        progress = document.createElement("div");
+        progress.className = "comfy-server-download-progress text-xs text-secondary";
+        progress.style.marginTop = "4px";
+        listItem.appendChild(progress);
+    }
+    return progress;
+}
+
+async function streamProgress(response, onUpdate) {
+    const reader = response.body?.getReader();
+    if (!reader) {
+        throw new Error("No response body to read progress from");
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+            if (!line.trim()) continue;
+            let data;
+            try {
+                data = JSON.parse(line);
+            } catch (err) {
+                console.warn("Failed to parse progress update", err);
+                continue;
+            }
+            onUpdate(data);
+        }
+    }
+
+    if (buffer.trim()) {
+        try {
+            onUpdate(JSON.parse(buffer));
+        } catch (err) {
+            console.warn("Failed to parse final progress update", err);
+        }
+    }
+}
+
 app.registerExtension({
     name: "Comfy.ServerModelDownloader",
     setup() {
         document.addEventListener("click", async (event) => {
             const target = event.target;
             if (!(target instanceof HTMLElement)) return;
-            if (target.tagName !== "BUTTON") return;
-            if (!target.title) return;
+            const button = target.closest("button");
+            if (!button) return;
+            if (!button.title) return;
 
             const container = target.closest(".comfy-missing-models");
             if (!container) return;
 
-            const labelSpan = target.closest(".flex")?.querySelector("span");
+            const labelSpan = button.closest("li")?.querySelector("span[title]") || button.closest(".flex")?.querySelector("span");
             const labelText = labelSpan?.textContent?.trim();
             if (!labelText) return;
 
@@ -49,16 +100,18 @@ app.registerExtension({
             const filename = nameParts.join("/");
             if (!folder || !filename) return;
 
-            const buttonText = target.textContent?.trim().toLowerCase() || "";
+            const buttonText = button.textContent?.trim().toLowerCase() || "";
             if (!buttonText.startsWith("download")) return;
 
             event.preventDefault();
             event.stopPropagation();
 
-            const url = target.title;
-            const originalLabel = target.textContent;
-            target.textContent = "Downloading...";
-            target.disabled = true;
+            const url = button.title;
+            const originalLabel = button.textContent;
+            const progressEl = ensureProgressElement(button);
+            if (progressEl) progressEl.textContent = "Starting server download...";
+            button.textContent = "Downloading...";
+            button.disabled = true;
 
             try {
                 let token = getStoredToken();
@@ -69,20 +122,37 @@ app.registerExtension({
                     response = await requestDownload({ url, folder, filename, token });
                 }
 
-                const data = await response.json();
                 if (!response.ok) {
+                    const data = await response.json();
                     throw new Error(data?.error || response.statusText);
                 }
-                target.textContent = "Downloaded";
+
+                await streamProgress(response, (update) => {
+                    if (update.error) {
+                        throw new Error(update.error);
+                    }
+                    if (typeof update.progress === "number") {
+                        const pct = Math.floor(update.progress * 100);
+                        button.textContent = `Downloading ${pct}%`;
+                        if (progressEl) progressEl.textContent = `Server download ${pct}%`;
+                    }
+                    if (update.message) {
+                        if (progressEl) progressEl.textContent = update.message;
+                    }
+                });
+
+                button.textContent = "Downloaded";
                 setTimeout(() => {
-                    target.textContent = originalLabel;
+                    button.textContent = originalLabel;
+                    if (progressEl) progressEl.textContent = "";
                 }, 1500);
             } catch (err) {
                 const message = err?.message || err;
                 alert(`Server download failed: ${message}`);
-                target.textContent = originalLabel;
+                button.textContent = originalLabel;
+                if (progressEl) progressEl.textContent = "";
             } finally {
-                target.disabled = false;
+                button.disabled = false;
             }
         });
     }

@@ -141,25 +141,67 @@ class ModelFileManager:
             if huggingface_token:
                 headers["Authorization"] = f"Bearer {huggingface_token}"
 
+            total_bytes = 0
+            emitted_progress = 0
+
+            async def emit_progress(resp: web.StreamResponse, *, progress: float | None = None, error: str | None = None):
+                payload = {}
+                if progress is not None:
+                    payload["progress"] = progress
+                if error is not None:
+                    payload["error"] = error
+                if not payload:
+                    return
+                await resp.write(json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
+                await resp.drain()
+
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url, headers=headers) as response:
                         if response.status != 200:
                             return web.json_response({"error": f"Download failed with status {response.status}"}, status=response.status)
 
-                        with open(destination_path, "wb") as outfile:
-                            async for chunk in response.content.iter_chunked(1024 * 1024):
-                                outfile.write(chunk)
+                        content_length = response.headers.get("Content-Length")
+                        total_length = int(content_length) if content_length and content_length.isdigit() else None
+
+                        stream_response = web.StreamResponse(status=200)
+                        stream_response.content_type = "application/x-ndjson"
+                        await stream_response.prepare(request)
+
+                        try:
+                            with open(destination_path, "wb") as outfile:
+                                async for chunk in response.content.iter_chunked(1024 * 1024):
+                                    outfile.write(chunk)
+                                    total_bytes += len(chunk)
+
+                                    if total_length:
+                                        progress = min(total_bytes / total_length, 1.0)
+                                        if progress - emitted_progress >= 0.01:
+                                            emitted_progress = progress
+                                            await emit_progress(stream_response, progress=progress)
+
+                            await emit_progress(stream_response, progress=1.0)
+                            await stream_response.write(json.dumps({
+                                "message": "Download complete",
+                                "path": destination_path,
+                                "folder": folder,
+                                "filename": normalized_relative,
+                            }, separators=(",", ":")).encode("utf-8") + b"\n")
+                        except Exception as e:
+                            logging.exception("Failed to download model")
+                            if os.path.exists(destination_path):
+                                try:
+                                    os.remove(destination_path)
+                                except OSError:
+                                    pass
+                            await emit_progress(stream_response, error=str(e))
+                        finally:
+                            await stream_response.write_eof()
+
+                        return stream_response
             except Exception as e:
                 logging.exception("Failed to download model")
                 return web.json_response({"error": str(e)}, status=500)
-
-            return web.json_response({
-                "message": "Download complete",
-                "path": destination_path,
-                "folder": folder,
-                "filename": normalized_relative,
-            })
 
     def get_model_file_list(self, folder_name: str):
         folder_name = map_legacy(folder_name)
