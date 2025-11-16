@@ -42,6 +42,28 @@ function ensureProgressElement(button) {
     return progress;
 }
 
+function formatBytes(bytes, total) {
+    const formatter = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
+    const base = 1024;
+    const units = ["B", "KB", "MB", "GB"];
+
+    const format = (value) => {
+        let size = value;
+        let unit = units[0];
+        for (let i = 1; i < units.length && size >= base; i++) {
+            size /= base;
+            unit = units[i];
+        }
+        return `${formatter.format(size)} ${unit}`;
+    };
+
+    const formattedCurrent = format(bytes);
+    if (typeof total === "number" && total > 0) {
+        return `${formattedCurrent} / ${format(total)}`;
+    }
+    return formattedCurrent;
+}
+
 async function streamProgress(response, onUpdate) {
     const reader = response.body?.getReader();
     if (!reader) {
@@ -123,18 +145,33 @@ app.registerExtension({
                 }
 
                 if (!response.ok) {
-                    const data = await response.json();
-                    throw new Error(data?.error || response.statusText);
+                    let message = response.statusText;
+                    try {
+                        const data = await response.json();
+                        message = data?.error || message;
+                    } catch (_) {
+                        // ignore parse errors and fallback to status text
+                    }
+                    throw new Error(message);
                 }
 
                 await streamProgress(response, (update) => {
                     if (update.error) {
                         throw new Error(update.error);
                     }
+                    const hasPercent = typeof update.progress === "number";
                     if (typeof update.progress === "number") {
                         const pct = Math.floor(update.progress * 100);
                         button.textContent = `Downloading ${pct}%`;
                         if (progressEl) progressEl.textContent = `Server download ${pct}%`;
+                    }
+                    if (typeof update.bytes === "number" && !hasPercent) {
+                        const total = typeof update.total_bytes === "number" ? update.total_bytes : undefined;
+                        const text = formatBytes(update.bytes, total);
+                        if (button.textContent?.startsWith("Downloading")) {
+                            button.textContent = `Downloading ${text}`;
+                        }
+                        if (progressEl) progressEl.textContent = `Downloaded ${text}`;
                     }
                     if (update.message) {
                         if (progressEl) progressEl.textContent = update.message;

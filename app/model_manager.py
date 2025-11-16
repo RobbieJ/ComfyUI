@@ -143,20 +143,36 @@ class ModelFileManager:
 
             total_bytes = 0
             emitted_progress = 0
+            last_emit_bytes = 0
 
-            async def emit_progress(resp: web.StreamResponse, *, progress: float | None = None, error: str | None = None):
+            async def emit_progress(
+                resp: web.StreamResponse,
+                *,
+                progress: float | None = None,
+                error: str | None = None,
+                message: str | None = None,
+                bytes_written: int | None = None,
+                total_length: int | None = None,
+            ):
                 payload = {}
                 if progress is not None:
                     payload["progress"] = progress
                 if error is not None:
                     payload["error"] = error
+                if message is not None:
+                    payload["message"] = message
+                if bytes_written is not None:
+                    payload["bytes"] = bytes_written
+                if total_length is not None:
+                    payload["total_bytes"] = total_length
                 if not payload:
                     return
                 await resp.write(json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
                 await resp.drain()
 
             try:
-                async with aiohttp.ClientSession() as session:
+                timeout = aiohttp.ClientTimeout(total=60 * 60)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.get(url, headers=headers) as response:
                         if response.status != 200:
                             return web.json_response({"error": f"Download failed with status {response.status}"}, status=response.status)
@@ -168,6 +184,13 @@ class ModelFileManager:
                         stream_response.content_type = "application/x-ndjson"
                         await stream_response.prepare(request)
 
+                        await emit_progress(
+                            stream_response,
+                            message=f"Downloading to {os.path.relpath(destination_path, target_folder)}",
+                            total_length=total_length,
+                            bytes_written=0,
+                        )
+
                         try:
                             with open(destination_path, "wb") as outfile:
                                 async for chunk in response.content.iter_chunked(1024 * 1024):
@@ -178,9 +201,25 @@ class ModelFileManager:
                                         progress = min(total_bytes / total_length, 1.0)
                                         if progress - emitted_progress >= 0.01:
                                             emitted_progress = progress
-                                            await emit_progress(stream_response, progress=progress)
+                                            await emit_progress(
+                                                stream_response,
+                                                progress=progress,
+                                                bytes_written=total_bytes,
+                                                total_length=total_length,
+                                            )
+                                    elif total_bytes - last_emit_bytes >= 1 * 1024 * 1024:
+                                        last_emit_bytes = total_bytes
+                                        await emit_progress(
+                                            stream_response,
+                                            bytes_written=total_bytes,
+                                        )
 
-                            await emit_progress(stream_response, progress=1.0)
+                            await emit_progress(
+                                stream_response,
+                                progress=1.0,
+                                bytes_written=total_bytes,
+                                total_length=total_length,
+                            )
                             await stream_response.write(json.dumps({
                                 "message": "Download complete",
                                 "path": destination_path,
